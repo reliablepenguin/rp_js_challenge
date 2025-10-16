@@ -51,30 +51,21 @@ Client → Nginx → Apache (PHP-FPM) → auto_prepend_file (sec_js_gate.php) �
   └─ else → 302 to /js-check.php?b=<original>
 
 /js-check.php → client runs tiny JS (~100ms) → fetch /__js_challenge.php (issuer)
-→ issuer sets HttpOnly cookie → client navigates back to <original URL> → gate validates → Drupal serves page
-```
-
-Client → Nginx → Apache (PHP-FPM) → auto_prepend_file (sec_js_gate.php) →
-├─ if valid cookie → continue to Drupal (normal request)
-└─ if missing/invalid → 302 to /js-check.php?b=<original>
-
-/js-check.php → client runs tiny JS (100ms) → fetch /__js_challenge.php (issuer)
-→ issuer sets HttpOnly cookie → client navigates back to <original URL> → gate validates → Drupal serves page
-
+→ issuer sets HttpOnly cookie → client navigates back to <original URL>
+→ gate validates → Drupal serves page
 ```
 
 ---
 
 ## Components & Files
+
 Assuming `example.com` docroot at `/var/www/vhosts/example.com/httpdocs`.
 
 ```
-
 /var/www/vhosts/example.com/priv/SEC_JS_SECRET          # HMAC key (outside webroot)
 /var/www/vhosts/example.com/priv/sec_js_gate.php        # gate (auto_prepend_file)
 /var/www/vhosts/example.com/httpdocs/js-check.php       # check page (HTML + JS)
 /var/www/vhosts/example.com/httpdocs/__js_challenge.php # cookie issuer
-
 ```
 
 > Replace `example.com` with the actual domain path in Plesk. Ensure `/priv/` is **outside** webroot to keep secrets non-public.
@@ -86,55 +77,62 @@ Assuming `example.com` docroot at `/var/www/vhosts/example.com/httpdocs`.
 **Objectives:** prevent trivial non-JS scraping and scripted abuse while keeping friction near-zero for humans and legitimate crawlers.
 
 **Mechanisms**
-- **One-time JS proof:** On first visit per short window, the browser performs a ~100ms WebCrypto digest loop. This is enough to filter basic bots that don’t execute JS.
-- **Short‑lived signed token:** Server issues `sec_js` (HttpOnly, Secure, SameSite=Lax) containing a JSON payload `{ v, exp, ua }`, where `exp` is a 5–10 minute TTL and `ua` is an optional 12‑hex SHA‑256 prefix of the User‑Agent. Payload is protected with HMAC‑SHA256 using a secret stored **outside** webroot.
-- **Pre‑app enforcement:** A tiny PHP gate (`auto_prepend_file`) validates the cookie *before* Drupal boots. On failure, it 302s to the check page and exits.
-- **Bypasses:** Static assets, admin/login, cron, the challenge endpoints, and **authenticated Drupal sessions (cookies starting with `SSESS`)** are always allowed to avoid breaking admin or logged-in UX.
-- **Good bot allowlist:** Built into the gate. Googlebot/Bingbot are verified via forward‑confirmed reverse DNS; several reputable crawlers and social preview bots are allowed by UA policy. (Details in Implementation Step 4.)
+
+* **One-time JS proof:** On first visit per short window, the browser performs a ~100ms WebCrypto digest loop. This is enough to filter basic bots that don’t execute JS.
+* **Short‑lived signed token:** Server issues `sec_js` (HttpOnly, Secure, SameSite=Lax) containing a JSON payload `{ v, exp, ua }`, where `exp` is a 5–10 minute TTL and `ua` is an optional 12‑hex SHA‑256 prefix of the User‑Agent. Payload is protected with HMAC‑SHA256 using a secret stored **outside** webroot.
+* **Pre‑app enforcement:** A tiny PHP gate (`auto_prepend_file`) validates the cookie *before* Drupal boots. On failure, it 302s to the check page and exits.
+* **Bypasses:** Static assets, admin/login, cron, the challenge endpoints, and **authenticated Drupal sessions (cookies starting with `SSESS`)** are always allowed to avoid breaking admin or logged-in UX.
+* **Good bot allowlist:** Built into the gate. Googlebot/Bingbot are verified via forward‑confirmed reverse DNS; several reputable crawlers and social preview bots are allowed by UA policy. (Details in Implementation Step 4.)
 
 **Threat model snapshot**
-- **Stops/Slows:** trivial curl/scrapy, many headless fetchers that ignore JS or cookies, low‑effort credential spray.
-- **Not a silver bullet against:** high‑end headless browsers with cookie handling and human‑like behavior; pair with WAF/rate limiting for those.
-- **Privacy:** no persistent fingerprinting; token contains no PII; TTL keeps identifiers short‑lived.
+
+* **Stops/Slows:** trivial curl/scrapy, many headless fetchers that ignore JS or cookies, low‑effort credential spray.
+* **Not a silver bullet against:** high‑end headless browsers with cookie handling and human‑like behavior; pair with WAF/rate limiting for those.
+* **Privacy:** no persistent fingerprinting; token contains no PII; TTL keeps identifiers short‑lived.
 
 ---
 
 ## SEO Impact & Search Crawler Access
 
 ### Summary
-- The JS challenge is **transparent to real users** and runs once per 10 minutes (configurable). It returns a **302 (temporary)** redirect to a `noindex` page, then immediately back to the original URL.
-- Major search engines often **do not execute JS** for discovery. To avoid crawl/indexing issues, we **allowlist known good crawlers** so they bypass the challenge entirely.
-- The challenge endpoints are explicitly **`no-store`** and marked with **`<meta name=\"robots\" content=\"noindex\">`**, and we recommend disallowing these paths in `robots.txt`.
+
+* The JS challenge is **transparent to real users** and runs once per 10 minutes (configurable). It returns a **302 (temporary)** redirect to a `noindex` page, then immediately back to the original URL.
+* Major search engines often **do not execute JS** for discovery. To avoid crawl/indexing issues, we **allowlist known good crawlers** so they bypass the challenge entirely.
+* The challenge endpoints are explicitly **`no-store`** and marked with **`<meta name=\"robots\" content=\"noindex\">`**, and we recommend disallowing these paths in `robots.txt`.
 
 ### Recommended robots.txt entries
-```
 
+```
 User-agent: *
 Disallow: /js-check.php
 Disallow: /__js_challenge.php
-
-````
+```
 
 ### Why SEO impact is minimal
-- Human visitors and SERP clickers are unaffected beyond a ~100ms check once per session window.
-- Search bots (Googlebot/Bingbot/etc.) are **bypassed** using UA + reverse DNS verification (see below), so they see the site normally.
-- We use **302**, not 301, so there is no lasting redirect signal.
+
+* Human visitors and SERP clickers are unaffected beyond a ~100ms check once per session window.
+* Search bots (Googlebot/Bingbot/etc.) are **bypassed** using UA + reverse DNS verification (see below), so they see the site normally.
+* We use **302**, not 301, so there is no lasting redirect signal.
 
 ---
 
 ## Good Bot Allowlist (Search & Link Preview Crawlers)
+
 We support two layers:
-1) **Edge hint (nginx):** Skip the challenge early for requests whose **User-Agent** matches known crawlers. (Fast, but headers are spoofable.)
-2) **Authoritative check (PHP gate):** For high-value bots (Googlebot/Bingbot), perform **reverse DNS verification** before bypassing, per their published guidance. This happens in the tiny gate file before Drupal.
+
+1. **Edge hint (nginx):** Skip the challenge early for requests whose **User-Agent** matches known crawlers. (Fast, but headers are spoofable.)
+2. **Authoritative check (PHP gate):** For high-value bots (Googlebot/Bingbot), perform **reverse DNS verification** before bypassing, per their published guidance. This happens in the tiny gate file before Drupal.
 
 ### 1) Optional nginx hint (per-domain Additional nginx directives)
+
 > Keep this as a *hint*; the PHP gate below does the real verification.
+
 ```nginx
 # Allowlisted crawlers (UA header check only; pair with PHP RDNS for safety)
 if ($http_user_agent ~* "(Googlebot|Google-InspectionTool|AdsBot-Google|Bingbot|BingPreview|DuckDuckBot|Applebot|Twitterbot|facebookexternalhit|LinkedInBot|Slackbot|Discordbot)") {
   set $rp_bypass 1;
 }
-````
+```
 
 ### 2) Authoritative verification (built into the gate)
 
