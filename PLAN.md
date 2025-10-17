@@ -245,19 +245,24 @@ Depending on your PHP handler in Plesk, use **one** of the following methods to 
 
 #### A) PHP-FPM served by **Apache** (most common)
 
-Add to **Domains → Apache & nginx Settings → Additional Apache directives (HTTPS)**:
+Add to **Domains → Apache & nginx Settings → Additional Apache directives (HTTPS)**. This version **executes PHP** in the mapped folder via your domain’s PHP‑FPM socket (prevents the “download instead of render” issue):
 
 ```apache
 # Map URLs to files outside httpdocs
-Alias /js-check.php \
-    /var/www/vhosts/example.com/challenge/js-check.php
-Alias /__js_challenge.php \
-    /var/www/vhosts/example.com/challenge/__js_challenge.php
+Alias /js-check.php        /var/www/vhosts/example.com/challenge/js-check.php
+Alias /__js_challenge.php  /var/www/vhosts/example.com/challenge/__js_challenge.php
 
+# Allow Apache/PHP-FPM to read them, and execute PHP here
 <Directory "/var/www/vhosts/example.com/challenge">
     Require all granted
-    # In Plesk, PHP-FPM via Apache is already wired; no extra handler lines needed.
-    # Ensure no caching of challenge endpoints
+    AllowOverride None
+    Options -Indexes
+
+    # Execute .php via the domain's PHP-FPM socket
+    <FilesMatch "\.ph(p[0-9]?|tml)$">
+        SetHandler "proxy:unix:/var/www/vhosts/system/example.com/php-fpm.sock|fcgi://localhost/"
+    </FilesMatch>
+
     <Files "js-check.php">
         Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
     </Files>
@@ -267,16 +272,14 @@ Alias /__js_challenge.php \
 </Directory>
 ```
 
-> Replace `example.com` paths as appropriate.
-
 #### B) PHP-FPM served by **nginx**
 
-Add to **Domains → Apache & nginx Settings → Additional nginx directives (HTTPS)**:
+Add to **Domains → Apache & nginx Settings → Additional nginx directives (HTTPS)**. This calls PHP‑FPM directly from nginx (no Apache Alias needed):
 
 ```nginx
 # Serve challenge scripts from outside webroot via nginx+PHP-FPM
 location = /js-check.php {
-    include proxy_fcgi.conf; # Plesk includes fastcgi params; otherwise include snippets/fastcgi-php.conf
+    include proxy_fcgi.conf;  # Plesk provides this include
     fastcgi_param SCRIPT_FILENAME /var/www/vhosts/example.com/challenge/js-check.php;
     fastcgi_pass "unix:/var/www/vhosts/system/example.com/php-fpm.sock";
 }
@@ -287,7 +290,7 @@ location = /__js_challenge.php {
 }
 ```
 
-> The socket path varies; confirm under **PHP Settings** for the domain, or use the TCP form `127.0.0.1:9070` if configured that way.
+> If PHP files **download instead of render**, you’re missing the `SetHandler … proxy:unix:/…/php-fpm.sock` (Apache) or `fastcgi_pass` (nginx) binding for the mapped folder.
 
 ---
 
