@@ -62,15 +62,15 @@ Client → Nginx → Apache (PHP-FPM) → auto_prepend_file (sec_js_gate.php) �
 Assuming `example.com` docroot at `/var/www/vhosts/example.com/httpdocs`.
 
 ```
-/var/www/vhosts/example.com/priv/SEC_JS_SECRET                 # HMAC key (outside webroot)
-/var/www/vhosts/example.com/priv/sec_js_gate.php               # gate (auto_prepend_file)
-/var/www/vhosts/example.com/priv/challenge/js-check.php        # check page (HTML + JS) — outside webroot
-/var/www/vhosts/example.com/priv/challenge/__js_challenge.php  # cookie issuer — outside webroot
+/var/www/vhosts/example.com/challenge/SEC_JS_SECRET                 # HMAC key (outside webroot)
+/var/www/vhosts/example.com/challenge/sec_js_gate.php               # gate (auto_prepend_file)
+/var/www/vhosts/example.com/challenge/js-check.php        # check page (HTML + JS) — outside webroot
+/var/www/vhosts/example.com/challenge/__js_challenge.php  # cookie issuer — outside webroot
 ```
 
 > We intentionally keep the challenge scripts **outside** the app repo (httpdocs) to separate sysadmin‑owned security controls from developer code. They are mapped into public URLs via web server configuration below.
 
-> Replace `example.com` with the actual domain path in Plesk. Ensure `/priv/` is **outside** webroot to keep secrets non-public.
+> Replace `example.com` with the actual domain path in Plesk. Ensure `/challenge/` is **outside** `httpdocs` (app repo) to keep secrets non-public.
 
 ---
 
@@ -161,149 +161,13 @@ The good‑bot allowlist is **implemented inside the PHP gate** (see Implementat
 ```bash
 # Run as root or appropriate user
 umask 077
-mkdir -p /var/www/vhosts/example.com/priv
-openssl rand -base64 48 > /var/www/vhosts/example.com/priv/SEC_JS_SECRET
+mkdir -p /var/www/vhosts/example.com/challenge
+openssl rand -base64 48 > /var/www/vhosts/example.com/challenge/SEC_JS_SECRET
 ```
 
-### 2) Create `/priv/challenge/js-check.php`
+### 2) Create `/challenge/js-check.php`
 
-````php
-<?php
-// /priv/challenge/js-check.php
-header('Content-Type: text/html; charset=utf-8');
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-$back = isset($_GET['b']) ? $_GET['b'] : '/';
-?>
-<!doctype html><meta charset="utf-8">
-<title>Checking your browser…</title>
-<meta name="robots" content="noindex">
-<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:4rem;max-width:42rem}</style>
-<p>One moment while we verify your browser…</p>
-<noscript><p>Please enable JavaScript or continue to <a href="/user/login">login</a>.</p></noscript>
-<script>
-(async () => {
-  // ~100ms of trivial work
-  const nonce = crypto.getRandomValues(new Uint8Array(32));
-  for (let i=0;i<4000;i++) { await crypto.subtle.digest("SHA-256", nonce); }
-  // Ask server to issue HttpOnly cookie, then go back
-  await fetch("/__js_challenge.php", { credentials:"include" });
-  location.replace(<?= json_encode($back, JSON_UNESCAPED_SLASHES) ?>);
-})();
-</script>
-```php
-<?php
-// /httpdocs/js-check.php
-header('Content-Type: text/html; charset=utf-8');
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-$back = isset($_GET['b']) ? $_GET['b'] : '/';
-?>
-<!doctype html><meta charset="utf-8">
-<title>Checking your browser…</title>
-<meta name="robots" content="noindex">
-<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:4rem;max-width:42rem}</style>
-<p>One moment while we verify your browser…</p>
-<noscript><p>Please enable JavaScript or continue to <a href="/user/login">login</a>.</p></noscript>
-<script>
-(async () => {
-  // ~100ms of trivial work
-  const nonce = crypto.getRandomValues(new Uint8Array(32));
-  for (let i=0;i<4000;i++) { await crypto.subtle.digest("SHA-256", nonce); }
-  // Ask server to issue HttpOnly cookie, then go back
-  await fetch("/__js_challenge.php", { credentials:"include" });
-  location.replace(<?= json_encode($back, JSON_UNESCAPED_SLASHES) ?>);
-})();
-</script>
-````
-
-### 3) Create `/priv/challenge/__js_challenge.php`
-
-````php
-<?php
-declare(strict_types=1);
-
-// /priv/challenge/__js_challenge.php
-header('Content-Type: text/plain; charset=utf-8');
-header('Cache-Control: no-store');
-
-$secret_path = dirname(__DIR__) . '/SEC_JS_SECRET';
-$secret = @file_get_contents($secret_path);
-if ($secret === false) { http_response_code(500); exit("secret missing"); }
-
-function b64u(string $bin): string {
-  return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
-}
-
-$ttl   = 600;             // 10 minutes
-$now   = time();
-$exp   = $now + $ttl;
-$ver   = 1;
-
-// (Optional) bind loosely to UA to make blind re-use harder
-$ua    = $_SERVER['HTTP_USER_AGENT'] ?? '';
-$ua12  = substr(hash('sha256',$ua),0,12);
-$payload = json_encode(['v'=>$ver,'exp'=>$exp,'ua'=>$ua12], JSON_UNESCAPED_SLASHES);
-$sig     = hash_hmac('sha256', $payload, $secret, true);
-$token   = b64u($payload) . '.' . b64u($sig);
-
-// Secure cookie attrs
-$cookie_name  = 'sec_js';
-$cookie_value = $token;
-$cookie_opts  = [
-  'expires'  => $exp,
-  'path'     => '/',
-  'domain'   => '',         // default to current host
-  'secure'   => true,
-  'httponly' => true,
-  'samesite' => 'Lax',
-];
-
-setcookie($cookie_name, $cookie_value, $cookie_opts);
-echo "ok";
-```php
-<?php
-declare(strict_types=1);
-
-// /httpdocs/__js_challenge.php
-header('Content-Type: text/plain; charset=utf-8');
-header('Cache-Control: no-store');
-
-$secret_path = dirname(__DIR__) . '/priv/SEC_JS_SECRET';
-$secret = @file_get_contents($secret_path);
-if ($secret === false) { http_response_code(500); exit("secret missing"); }
-
-function b64u(string $bin): string {
-  return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
-}
-
-$ttl   = 600;             // 10 minutes
-$now   = time();
-$exp   = $now + $ttl;
-$ver   = 1;
-
-// (Optional) bind loosely to UA to make blind re-use harder
-$ua    = $_SERVER['HTTP_USER_AGENT'] ?? '';
-$ua12  = substr(hash('sha256',$ua),0,12);
-$payload = json_encode(['v'=>$ver,'exp'=>$exp,'ua'=>$ua12], JSON_UNESCAPED_SLASHES);
-$sig     = hash_hmac('sha256', $payload, $secret, true);
-$token   = b64u($payload) . '.' . b64u($sig);
-
-// Secure cookie attrs
-$cookie_name  = 'sec_js';
-$cookie_value = $token;
-$cookie_opts  = [
-  'expires'  => $exp,
-  'path'     => '/',
-  'domain'   => '',         // default to current host
-  'secure'   => true,
-  'httponly' => true,
-  'samesite' => 'Lax',
-];
-
-setcookie($cookie_name, $cookie_value, $cookie_opts);
-echo "ok";
-````
+### 3) Create `/challenge/__js_challenge.php`
 
 ### 4) Map the outside-webroot scripts to public URLs
 
@@ -316,11 +180,11 @@ Add to **Domains → Apache & nginx Settings → Additional Apache directives (H
 ```apache
 # Map URLs to files outside httpdocs
 Alias /js-check.php \
-  	/var/www/vhosts/example.com/priv/challenge/js-check.php
+    /var/www/vhosts/example.com/challenge/js-check.php
 Alias /__js_challenge.php \
-  	/var/www/vhosts/example.com/priv/challenge/__js_challenge.php
+    /var/www/vhosts/example.com/challenge/__js_challenge.php
 
-<Directory "/var/www/vhosts/example.com/priv/challenge">
+<Directory "/var/www/vhosts/example.com/challenge">
     Require all granted
     # In Plesk, PHP-FPM via Apache is already wired; no extra handler lines needed.
     # Ensure no caching of challenge endpoints
@@ -343,12 +207,12 @@ Add to **Domains → Apache & nginx Settings → Additional nginx directives (HT
 # Serve challenge scripts from outside webroot via nginx+PHP-FPM
 location = /js-check.php {
     include proxy_fcgi.conf; # Plesk includes fastcgi params; otherwise include snippets/fastcgi-php.conf
-    fastcgi_param SCRIPT_FILENAME /var/www/vhosts/example.com/priv/challenge/js-check.php;
+    fastcgi_param SCRIPT_FILENAME /var/www/vhosts/example.com/challenge/js-check.php;
     fastcgi_pass "unix:/var/www/vhosts/system/example.com/php-fpm.sock";
 }
 location = /__js_challenge.php {
     include proxy_fcgi.conf;
-    fastcgi_param SCRIPT_FILENAME /var/www/vhosts/example.com/priv/challenge/__js_challenge.php;
+    fastcgi_param SCRIPT_FILENAME /var/www/vhosts/example.com/challenge/__js_challenge.php;
     fastcgi_pass "unix:/var/www/vhosts/system/example.com/php-fpm.sock";
 }
 ```
@@ -465,7 +329,7 @@ exit;
 **Domains → example.com → PHP Settings → Additional configuration directives**:
 
 ```
-auto_prepend_file = /var/www/vhosts/example.com/priv/sec_js_gate.php
+auto_prepend_file = /var/www/vhosts/example.com/challenge/sec_js_gate.php
 ```
 
 Click **OK/Apply**.
@@ -635,11 +499,11 @@ In **Apache & nginx Settings → Additional Apache directives (HTTPS)**:
 
 ## Appendix A — Command & Path Cheatsheet
 
-* Secret: `/var/www/vhosts/example.com/priv/SEC_JS_SECRET`
-* Gate: `/var/www/vhosts/example.com/priv/sec_js_gate.php`
+* Secret: `/var/www/vhosts/example.com/challenge/SEC_JS_SECRET`
+* Gate: `/var/www/vhosts/example.com/challenge/sec_js_gate.php`
 * Check page: `/var/www/vhosts/example.com/httpdocs/js-check.php`
 * Issuer: `/var/www/vhosts/example.com/httpdocs/__js_challenge.php`
-* Plesk PHP setting: `auto_prepend_file = /var/www/vhosts/example.com/priv/sec_js_gate.php`
+* Plesk PHP setting: `auto_prepend_file = /var/www/vhosts/example.com/challenge/sec_js_gate.php`
 * Nginx global (optional): `/etc/nginx/conf.d/rp-js-rl.conf`
 
 ---
