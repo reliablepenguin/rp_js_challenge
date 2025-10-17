@@ -167,7 +167,77 @@ openssl rand -base64 48 > /var/www/vhosts/example.com/challenge/SEC_JS_SECRET
 
 ### 2) Create `/challenge/js-check.php`
 
+```php
+<?php
+// /challenge/js-check.php
+header('Content-Type: text/html; charset=utf-8');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+$back = isset($_GET['b']) ? $_GET['b'] : '/';
+?>
+<!doctype html><meta charset="utf-8">
+<title>Checking your browser…</title>
+<meta name="robots" content="noindex">
+<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:4rem;max-width:42rem}</style>
+<p>One moment while we verify your browser…</p>
+<noscript><p>Please enable JavaScript or continue to <a href="/user/login">login</a>.</p></noscript>
+<script>
+(async () => {
+  // ~100ms of trivial work
+  const nonce = crypto.getRandomValues(new Uint8Array(32));
+  for (let i=0;i<4000;i++) { await crypto.subtle.digest("SHA-256", nonce); }
+  // Ask server to issue HttpOnly cookie, then go back
+  await fetch("/__js_challenge.php", { credentials:"include" });
+  location.replace(<?= json_encode($back, JSON_UNESCAPED_SLASHES) ?>);
+})();
+</script>
+```
+
 ### 3) Create `/challenge/__js_challenge.php`
+
+```php
+<?php
+declare(strict_types=1);
+
+// /challenge/__js_challenge.php
+header('Content-Type: text/plain; charset=utf-8');
+header('Cache-Control: no-store');
+
+$secret_path = __DIR__ . '/SEC_JS_SECRET';
+$secret = @file_get_contents($secret_path);
+if ($secret === false) { http_response_code(500); exit("secret missing"); }
+
+function b64u(string $bin): string {
+  return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
+}
+
+$ttl   = 600;             // 10 minutes
+$now   = time();
+$exp   = $now + $ttl;
+$ver   = 1;
+
+// (Optional) bind loosely to UA to make blind re-use harder
+$ua    = $_SERVER['HTTP_USER_AGENT'] ?? '';
+$ua12  = substr(hash('sha256',$ua),0,12);
+$payload = json_encode(['v'=>$ver,'exp'=>$exp,'ua'=>$ua12], JSON_UNESCAPED_SLASHES);
+$sig     = hash_hmac('sha256', $payload, $secret, true);
+$token   = b64u($payload) . '.' . b64u($sig);
+
+// Secure cookie attrs
+$cookie_name  = 'sec_js';
+$cookie_value = $token;
+$cookie_opts  = [
+  'expires'  => $exp,
+  'path'     => '/',
+  'domain'   => '',         // default to current host
+  'secure'   => true,
+  'httponly' => true,
+  'samesite' => 'Lax',
+];
+
+setcookie($cookie_name, $cookie_value, $cookie_opts);
+echo "ok";
+```
 
 ### 4) Map the outside-webroot scripts to public URLs
 
@@ -221,13 +291,13 @@ location = /__js_challenge.php {
 
 ---
 
-### 5) Create `/priv/sec_js_gate.php`
+### 5) Create `/challenge/sec_js_gate.php`
 
 ```php
 <?php
 declare(strict_types=1);
 
-// /priv/sec_js_gate.php — lightweight gate with crawler allowlist and Drupal SSESS bypass
+// /challenge/sec_js_gate.php — lightweight gate with crawler allowlist and Drupal SSESS bypass
 
 // BYPASS: safety paths that should never be gated
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
@@ -305,7 +375,7 @@ if ($tok && strpos($tok, '.') !== false) {
       $ua_hash = substr(hash('sha256', $ua), 0, 12);
       $ua_ok = !isset($data['ua']) || $data['ua'] === $ua_hash;
       if ($ua_ok) {
-        $secret = @file_get_contents(dirname(__DIR__) . '/priv/SEC_JS_SECRET');
+        $secret = @file_get_contents(__DIR__ . '/SEC_JS_SECRET');
         if ($secret !== false) {
           $expect = hash_hmac('sha256', $payload, $secret, true);
           if (hash_equals($expect, $sig)) {
@@ -361,36 +431,17 @@ if ($rp_bypass = 0) {
 
 # (Optional) enable if you set a global limit_req_zone
 # location ~ ^/(api|user/login|user/password) { limit_req zone=rl_api burst=30 nodelay; }
-```nginx
-# --- BYPASS: assets, health, admin, login, and the challenge endpoints
-set $rp_bypass 0;
-
-if ($request_uri ~ ^/(core|modules|themes|sites/.+/files/styles)/) { set $rp_bypass 1; }
-if ($request_uri ~ ^/(robots\.txt|favicon\.ico|sitemap\.xml)$)     { set $rp_bypass 1; }
-if ($request_uri ~ ^/(cron\.php|update\.php|admin|user/login))     { set $rp_bypass 1; }
-if ($request_uri ~ ^/(js-check\.php|__js_challenge\.php)(\?|$))    { set $rp_bypass 1; }
-
-# Only bounce if not bypassed and cookie absent
-if ($rp_bypass = 0) {
-  if ($http_cookie !~ "sec_js=") { return 302 /js-check.php?b=$request_uri; }
-}
-
-# (Optional) enable if you set a global limit_req_zone
-# location ~ ^/(api|user/login|user/password) { limit_req zone=rl_api burst=30 nodelay; }
-````
 
 > This is optional because the PHP gate already handles misses, but edge bouncing reduces PHP invocations on obvious bots.
 
 ---
 
 ## Optional: Global Nginx Rate Limiting (Server-Wide)
-
 Create once (root): `/etc/nginx/conf.d/rp-js-rl.conf`
-
 ```nginx
 # HTTP-level context (included by Plesk's nginx.conf)
 limit_req_zone $binary_remote_addr zone=rl_api:10m rate=10r/s;
-```
+````
 
 Test & reload:
 
@@ -501,8 +552,8 @@ In **Apache & nginx Settings → Additional Apache directives (HTTPS)**:
 
 * Secret: `/var/www/vhosts/example.com/challenge/SEC_JS_SECRET`
 * Gate: `/var/www/vhosts/example.com/challenge/sec_js_gate.php`
-* Check page: `/var/www/vhosts/example.com/httpdocs/js-check.php`
-* Issuer: `/var/www/vhosts/example.com/httpdocs/__js_challenge.php`
+* Check page: `/var/www/vhosts/example.com/challenge/js-check.php`
+* Issuer: `/var/www/vhosts/example.com/challenge/__js_challenge.php`
 * Plesk PHP setting: `auto_prepend_file = /var/www/vhosts/example.com/challenge/sec_js_gate.php`
 * Nginx global (optional): `/etc/nginx/conf.d/rp-js-rl.conf`
 
